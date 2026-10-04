@@ -6,3 +6,18 @@ opentorwart:
   upstream:
     base-url: ${UPSTREAM_BASE_URL:http://localhost:11434/v1}
     api-key: ${UPSTREAM_API_KEY:}
+
+  auth:
+    keys:
+      - team: oncology
+        key-hash: 766fb4e98fd01b99ffac00bc5165d3bdea003a0d1f25be235a2c1a522219494f
+
+  rate-limit:
+    capacity: 100
+    refill-per-minute: 100
+
+  budget:
+    soft-cap-percent: 80
+    default-max-output-tokens: 1000
+    teams:
+      oncology: 500
