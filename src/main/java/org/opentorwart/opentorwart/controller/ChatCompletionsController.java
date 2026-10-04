@@ -1,16 +1,20 @@
 package org.opentorwart.opentorwart.controller;
 
 
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.client.ClientHttpResponse;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 
@@ -45,22 +49,38 @@ public class ChatCompletionsController {
     }
 
     private ResponseEntity<StreamingResponseBody> streamCompletion(String requestBody) {
-        StreamingResponseBody body = out -> upstreamClient.post()
+
+        ClientHttpResponse upstream = upstreamClient.post()
                 .uri("/chat/completions")
                 .contentType(MediaType.APPLICATION_JSON)
                 .accept(MediaType.TEXT_EVENT_STREAM)
                 .body(requestBody)
-                .exchange((req, res) -> {
-                    try (InputStream in = res.getBody()) {
-                        byte[] buffer = new byte[1024];
-                        int n;
-                        while ((n = in.read(buffer)) != -1) {
-                            out.write(buffer, 0, n);
-                            out.flush();      // push each piece to the client now
-                        }
-                    }
-                    return null;
-                });
+                .exchange((req, res) -> res, false);
+
+        try {
+            HttpStatusCode status = upstream.getStatusCode();
+            if (status.isError()) {
+                byte[] error = upstream.getBody().readAllBytes();
+                upstream.close();
+                return ResponseEntity.status(status)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .body(out -> out.write(error));
+            }
+        } catch (IOException e) {
+            upstream.close();
+            throw new ResourceAccessException("Failed to read upstream response", e);
+        }
+
+        StreamingResponseBody body = out -> {
+            try (upstream; InputStream in = upstream.getBody()) {
+                byte[] buffer = new byte[1024];
+                int n;
+                while ((n = in.read(buffer)) != -1) {
+                    out.write(buffer, 0, n);
+                    out.flush();
+                }
+            }
+        };
 
         return ResponseEntity.ok()
                 .contentType(MediaType.TEXT_EVENT_STREAM)
