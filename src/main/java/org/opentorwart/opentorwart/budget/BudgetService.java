@@ -3,63 +3,94 @@ package org.opentorwart.opentorwart.budget;
 import org.opentorwart.opentorwart.Exceptions.BudgetExceededException;
 import org.opentorwart.opentorwart.config.BudgetProperties;
 import org.opentorwart.opentorwart.config.Reservation;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataAccessException;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
+import java.time.Duration;
+import java.time.YearMonth;
+import java.time.ZoneOffset;
+import java.util.List;
 
 @Service
 public class BudgetService {
 
-    private final BudgetProperties props;
-    private final Map<String, AtomicLong> usedTokens = new ConcurrentHashMap<>();
+    private static final Logger log = LoggerFactory.getLogger(BudgetService.class);
+    private static final Duration TTL = Duration.ofDays(40);
 
-    public BudgetService(BudgetProperties props) {
+    private final StringRedisTemplate redis;
+    private final RedisScript<Long> reserveScript;
+    private final BudgetProperties props;
+
+    public BudgetService(StringRedisTemplate redis, RedisScript<Long> reserveScript,
+                         BudgetProperties props) {
+        this.redis = redis;
+        this.reserveScript = reserveScript;
         this.props = props;
     }
 
-    /** Reserves tokens atomically, or throws BudgetExceededException if they don't fit. */
     public Reservation reserve(String team, long estimatedTokens) {
         Long limit = props.teams().get(team);
         if (limit == null) {
-            throw new BudgetExceededException(team);      // no budget configured → deny
+            throw new BudgetExceededException(team);              // fail closed: no budget configured
         }
 
-        AtomicLong counter = usedTokens.computeIfAbsent(team, k -> new AtomicLong());
+        String key = keyFor(team, currentMonth());
+        try {
+            Long result = redis.execute(reserveScript, List.of(key),
+                    String.valueOf(estimatedTokens),
+                    String.valueOf(limit),
+                    String.valueOf(TTL.toSeconds()));
 
-        while (true) {
-            long current = counter.get();                  // 1. read
-            long next = current + estimatedTokens;         // 2. compute
-            if (next > limit) {
-                throw new BudgetExceededException(team);   // 3. check
+            if (result == null || result < 0) {
+                throw new BudgetExceededException(team);
             }
-            if (counter.compareAndSet(current, next)) {    // 4. write, only if unchanged
-                return new Reservation(team, estimatedTokens);
+            return new Reservation(team, key, estimatedTokens);
+
+        } catch (DataAccessException e) {
+            if (!props.failOpen()) {
+                throw e;
             }
-            // another thread changed the value between 1 and 4 → retry with a fresh read
+            log.warn("Redis unavailable, budget check skipped for team={}", team, e);
+            return new Reservation(team, key, 0);                 // nothing reserved
         }
     }
 
-    /** Releases the reservation and charges the actual usage instead. */
     public void settle(Reservation reservation, long actualTokens) {
-        AtomicLong counter = usedTokens.get(reservation.team());
-        if (counter == null) {
-            return;                       // nothing was reserved, so nothing to settle
+        long delta = actualTokens - reservation.reservedTokens();
+        if (delta == 0) {
+            return;
         }
-        counter.addAndGet(actualTokens - reservation.reservedTokens());
+        try {
+            redis.opsForValue().increment(reservation.key(), delta);
+            redis.expire(reservation.key(), TTL);                 // key may be new (fail-open case)
+        } catch (DataAccessException e) {
+            log.warn("Budget settle failed for team={} delta={}", reservation.team(), delta, e);
+        }
     }
 
-    /** True if the team has used more than softCapPercent of its budget. */
     public boolean isAboveSoftCap(String team) {
         Long limit = props.teams().get(team);
         if (limit == null) {
-            return false;                 // no budget configured → assume not above soft cap
+            return false;
         }
-        AtomicLong counter = usedTokens.get(team);
-        if (counter == null) {
-            return false;                 // no tokens used → assume not above soft cap
+        try {
+            String value = redis.opsForValue().get(keyFor(team, currentMonth()));
+            long used = value == null ? 0 : Long.parseLong(value);
+            return used > limit * props.softCapPercent() / 100;
+        } catch (DataAccessException e) {
+            return false;
         }
-        return counter.get() > limit * props.softCapPercent() / 100;
+    }
+
+    private static YearMonth currentMonth() {
+        return YearMonth.now(ZoneOffset.UTC);
+    }
+
+    private static String keyFor(String team, YearMonth month) {
+        return "budget:" + team + ":" + month;
     }
 }

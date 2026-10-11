@@ -1,0 +1,12 @@
+services:
+  redis:
+    image: redis:8
+    container_name: my-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:
+    driver: local

@@ -1,12 +1,16 @@
 package org.opentorwart.opentorwart.filter;
 
 import io.github.bucket4j.Bucket;
+import io.github.bucket4j.BucketConfiguration;
 import io.github.bucket4j.ConsumptionProbe;
+import io.github.bucket4j.distributed.proxy.ProxyManager;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.opentorwart.opentorwart.config.RateLimitProperties;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -22,11 +26,18 @@ import java.util.concurrent.ConcurrentHashMap;
 @Component
 @Order(2)
 public class RateLimitFilter extends OncePerRequestFilter {
-    private final RateLimitProperties props;
-    private final Map<String, Bucket> buckets = new ConcurrentHashMap<>();
 
-    public RateLimitFilter(RateLimitProperties props) {
-        this.props = props;
+    private static final Logger log = LoggerFactory.getLogger(RateLimitFilter.class);
+    private final ProxyManager<String> proxyManager;
+    private final BucketConfiguration configuration;
+
+    public RateLimitFilter(ProxyManager<String> proxyManager, RateLimitProperties props) {
+        this.proxyManager = proxyManager;
+        this.configuration = BucketConfiguration.builder()
+                .addLimit(limit -> limit
+                        .capacity(props.capacity())
+                        .refillGreedy(props.refillPerMinute(), Duration.ofMinutes(1)))
+                .build();
     }
 
     @Override
@@ -43,8 +54,16 @@ public class RateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
-        Bucket bucket = buckets.computeIfAbsent(keyId, k -> newBucket());
-        ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+        ConsumptionProbe probe;
+        try {
+            probe = proxyManager.builder()
+                    .build("ratelimit:" + keyId, () -> configuration)
+                    .tryConsumeAndReturnRemaining(1);
+        } catch (Exception e) {
+            log.warn("Rate limiter unavailable, allowing request (fail open)", e);
+            chain.doFilter(request, response);
+            return;
+        }
 
         if (probe.isConsumed()) {
             response.setHeader("X-RateLimit-Remaining", String.valueOf(probe.getRemainingTokens()));
@@ -57,15 +76,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
         response.setHeader(HttpHeaders.RETRY_AFTER, String.valueOf(retryAfterSeconds));
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);
         response.getWriter().write("""
-                {"error":{"message":"Rate limit exceeded","type":"rate_limit_exceeded"}}
-                """);
-    }
-
-    private Bucket newBucket() {
-        return Bucket.builder()
-                .addLimit(limit -> limit
-                        .capacity(props.capacity())
-                        .refillGreedy(props.refillPerMinute(), Duration.ofMinutes(1)))
-                .build();
+            {"error":{"message":"Rate limit exceeded","type":"rate_limit_exceeded"}}
+            """);
     }
 }
