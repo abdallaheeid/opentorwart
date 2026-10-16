@@ -2,13 +2,14 @@ package org.opentorwart.opentorwart.controller;
 
 
 import jakarta.servlet.http.HttpServletRequest;
+import org.opentorwart.opentorwart.audit.AuditEvent;
+import org.opentorwart.opentorwart.audit.AuditService;
 import org.opentorwart.opentorwart.budget.BudgetService;
 import org.opentorwart.opentorwart.budget.TokenEstimator;
 import org.opentorwart.opentorwart.config.GatewayRequest;
 import org.opentorwart.opentorwart.config.Reservation;
 import org.opentorwart.opentorwart.filter.ApiKeyAuthFilter;
-import org.opentorwart.opentorwart.logging.RequestLog;
-import org.opentorwart.opentorwart.logging.RequestLogService;
+import org.opentorwart.opentorwart.pricing.CostCalculator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatusCode;
@@ -25,7 +26,10 @@ import tools.jackson.databind.node.ObjectNode;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.UUID;
 
 @RestController
 @RequestMapping("/v1")
@@ -35,20 +39,23 @@ public class ChatCompletionsController {
 
     private final RestClient upstreamClient;
     private final JsonMapper jsonMapper;
-    private final RequestLogService requestLogService;
+    private final AuditService auditService;
     private final BudgetService budgetService;
     private final TokenEstimator tokenEstimator;
+    private final CostCalculator costCalculator;
 
-    public ChatCompletionsController(RestClient upstreamClient, JsonMapper jsonMapper, RequestLogService requestLogService, BudgetService budgetService, TokenEstimator tokenEstimator) {
+    public ChatCompletionsController(RestClient upstreamClient, JsonMapper jsonMapper, AuditService auditService, BudgetService budgetService, TokenEstimator tokenEstimator, CostCalculator costCalculator) {
         this.upstreamClient = upstreamClient;
         this.jsonMapper = jsonMapper;
-        this.requestLogService = requestLogService;
+        this.auditService = auditService;
         this.budgetService = budgetService;
         this.tokenEstimator = tokenEstimator;
+        this.costCalculator = costCalculator;
     }
 
     @PostMapping(path = "/chat/completions", consumes = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<StreamingResponseBody> chatCompletions(@RequestBody String requestBody,
+                                                                 @RequestAttribute(ApiKeyAuthFilter.KEY_ATTRIBUTE) String keyId,
                                                                  @RequestAttribute(ApiKeyAuthFilter.TEAM_ATTRIBUTE) String team,
                                                                  HttpServletRequest httpRequest) {
         log.info("Request from team= {}", team);
@@ -56,7 +63,7 @@ public class ChatCompletionsController {
         boolean stream = request.path("stream").asBoolean(false);
         String model = request.path("model").asString();
 
-        GatewayRequest gr = new GatewayRequest(team, model, stream, System.nanoTime(), null);
+        GatewayRequest gr = new GatewayRequest(UUID.randomUUID(), Instant.now(), team, keyId, model, stream, System.nanoTime(), null);
         httpRequest.setAttribute(GatewayRequest.ATTRIBUTE, gr);
 
         Reservation reservation = budgetService.reserve(team, tokenEstimator.estimate(request));
@@ -72,19 +79,16 @@ public class ChatCompletionsController {
     }
 
     private ResponseEntity<StreamingResponseBody> blockingCompletion(String requestBody, GatewayRequest gr) {
-        long start = System.nanoTime();
         String body = upstreamClient.post()
                 .uri("/chat/completions")
                 .contentType(MediaType.APPLICATION_JSON)
                 .body(requestBody)
                 .retrieve()
                 .body(String.class);
-        long latencyMs = (System.nanoTime() - start) / 1_000_000;
 
-        JsonNode usage = extractUsage(body);       // the safe helper: returns null on any problem
+        JsonNode usage = extractUsage(body);
         budgetService.settle(gr.reservation(), actualTokens(usage, gr.reservation()));
-        requestLogService.record(new RequestLog(gr.team(), gr.model(), false, 200, latencyMs,
-                tokens(usage, "prompt_tokens"), tokens(usage, "completion_tokens")));
+        auditService.record(successEvent(gr, usage));
 
         return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_JSON)
@@ -92,7 +96,6 @@ public class ChatCompletionsController {
     }
 
     private ResponseEntity<StreamingResponseBody> streamCompletion(String requestBody, GatewayRequest gr) {
-        long start = System.nanoTime();
 
         ClientHttpResponse upstream = upstreamClient.post()
                 .uri("/chat/completions")
@@ -106,10 +109,9 @@ public class ChatCompletionsController {
             if (status.isError()) {
                 byte[] error = upstream.getBody().readAllBytes();
                 upstream.close();
-                budgetService.settle(gr.reservation(), 0);                  // full refund
-                requestLogService.record(new RequestLog(gr.team(), gr.model(), true, status.value(),
-                        (System.nanoTime() - start) / 1_000_000, null, null));
-                return ResponseEntity.status(status)
+                budgetService.settle(gr.reservation(), 0);
+                auditService.record(AuditEvent.failure(gr, status.value(), "upstream_error"));
+                return ResponseEntity.status(status.value())
                         .contentType(MediaType.APPLICATION_JSON)
                         .body(out -> out.write(error));
             }
@@ -135,10 +137,8 @@ public class ChatCompletionsController {
                     }
                 }
             } finally {
-                long latencyMs = (System.nanoTime() - start) / 1_000_000;
                 budgetService.settle(gr.reservation(), actualTokens(usage, gr.reservation()));
-                requestLogService.record(new RequestLog(gr.team(), gr.model(), true, 200, latencyMs,
-                        tokens(usage, "prompt_tokens"), tokens(usage, "completion_tokens")));
+                auditService.record(successEvent(gr, usage));
             }
         };
 
@@ -165,6 +165,13 @@ public class ChatCompletionsController {
 
     private static Integer tokens(JsonNode usage, String field) {
         return usage == null ? null : usage.path(field).asInt();
+    }
+
+    private AuditEvent successEvent(GatewayRequest gr, JsonNode usage) {
+        Integer promptTokens = tokens(usage, "prompt_tokens");
+        Integer completionTokens = tokens(usage, "completion_tokens");
+        return AuditEvent.of(gr, 200, null, promptTokens, completionTokens,
+                costCalculator.cost(gr.model(), promptTokens, completionTokens));
     }
 
 }

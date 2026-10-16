@@ -7,6 +7,18 @@ spring:
       host: localhost
       port: 6379
 
+  datasource:
+    url: jdbc:postgresql://localhost:5433/opentorwart
+    username: opentorwart
+    password: opentorwart
+
+  task:
+    execution:
+      pool:
+        core-size: 4
+        max-size: 8
+        queue-capacity: 10000
+
 opentorwart:
   upstream:
     base-url: ${UPSTREAM_BASE_URL:http://localhost:11434/v1}
@@ -18,8 +30,8 @@ opentorwart:
         key-hash: 766fb4e98fd01b99ffac00bc5165d3bdea003a0d1f25be235a2c1a522219494f
 
   rate-limit:
-    capacity: 3
-    refill-per-minute: 3
+    capacity: 100
+    refill-per-minute: 100
 
   budget:
     fail-open: true
@@ -27,3 +39,13 @@ opentorwart:
     default-max-output-tokens: 1000
     teams:
       oncology: 100000
+
+  pricing:
+    # € per 1 million tokens
+    models:
+      "[qwen2.5:0.5b]":
+        input: 0.10
+        output: 0.40
+      "[gpt-4o-mini]":
+        input: 0.14
+        output: 0.55

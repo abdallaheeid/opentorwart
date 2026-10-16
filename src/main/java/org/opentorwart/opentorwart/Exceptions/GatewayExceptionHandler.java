@@ -1,6 +1,8 @@
 package org.opentorwart.opentorwart.Exceptions;
 
 import jakarta.servlet.http.HttpServletRequest;
+import org.opentorwart.opentorwart.audit.AuditEvent;
+import org.opentorwart.opentorwart.audit.AuditService;
 import org.opentorwart.opentorwart.budget.BudgetService;
 import org.opentorwart.opentorwart.config.GatewayRequest;
 import org.opentorwart.opentorwart.logging.RequestLog;
@@ -16,18 +18,19 @@ import org.springframework.web.client.RestClientResponseException;
 @RestControllerAdvice
 public class GatewayExceptionHandler {
 
-    private final RequestLogService requestLogService;
+    private final AuditService auditService;
     private final BudgetService budgetService;
 
-    public GatewayExceptionHandler(RequestLogService requestLogService, BudgetService budgetService) {
-        this.requestLogService = requestLogService;
+
+    public GatewayExceptionHandler(AuditService auditService, BudgetService budgetService, RequestLogService requestLogService) {
+        this.auditService = auditService;
         this.budgetService = budgetService;
     }
 
     @ExceptionHandler(RestClientResponseException.class)
     public ResponseEntity<?> handleUpstreamError(RestClientResponseException ex,
                                                       HttpServletRequest request) {
-        handleFailure(request, ex.getStatusCode().value());
+        handleFailure(request, ex.getStatusCode().value(), "upstream_error");
         return ResponseEntity.status(ex.getStatusCode())
                 .contentType(MediaType.APPLICATION_JSON)
                 .body(ex.getResponseBodyAsString());
@@ -36,7 +39,7 @@ public class GatewayExceptionHandler {
     @ExceptionHandler(ResourceAccessException.class)
     public ResponseEntity<?> handleUpstreamUnreachable(ResourceAccessException ex,
                                                             HttpServletRequest request) {
-        handleFailure(request, HttpStatus.BAD_GATEWAY.value());
+        handleFailure(request, HttpStatus.BAD_GATEWAY.value(), "upstream_unreachable");
         return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
                 .contentType(MediaType.APPLICATION_JSON)
                 .body("""
@@ -44,21 +47,19 @@ public class GatewayExceptionHandler {
                       """);
     }
 
-    private void handleFailure(HttpServletRequest request, int status) {
+    private void handleFailure(HttpServletRequest request, int status, String errorType) {
         if (request.getAttribute(GatewayRequest.ATTRIBUTE) instanceof GatewayRequest gr) {
             if (gr.reservation() != null) {
-                budgetService.settle(gr.reservation(), 0);   // upstream failed → refund
+                budgetService.settle(gr.reservation(), 0);
             }
-            long latencyMs = (System.nanoTime() - gr.startNanos()) / 1_000_000;
-            requestLogService.record(new RequestLog(
-                    gr.team(), gr.model(), gr.stream(), status, latencyMs, null, null));
+            auditService.record(AuditEvent.failure(gr, status, errorType));
         }
     }
 
     @ExceptionHandler(BudgetExceededException.class)
     public ResponseEntity<String> handleBudgetExceeded(BudgetExceededException ex,
                                                        HttpServletRequest request) {
-        handleFailure(request, HttpStatus.TOO_MANY_REQUESTS.value());
+        handleFailure(request, HttpStatus.TOO_MANY_REQUESTS.value(), "insufficient_quota");
         return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
                 .contentType(MediaType.APPLICATION_JSON)
                 .body("""
